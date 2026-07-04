@@ -58,4 +58,5 @@ Configure auth for each provider used by the orchestrator or subagents. Use `/lo
 
 - The package does not include local Pi state, auth files, npm tokens, or `node_modules`.
 - npm publishing is configured for the public registry with public package access.
-- GitHub Actions publishes tagged releases (`v*`) using the repository secret `NPM_TOKEN`.
+- GitHub Actions publishes `v*` tags via npm Trusted Publishing (OIDC) with provenance.
+- Maintainers: configure npm Trusted Publisher for GitHub Actions with repo `redentordev/pi-orchestrator`, workflow `publish.yml`, environment `npm-publish`.
