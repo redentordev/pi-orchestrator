@@ -1,0 +1,8 @@
+.github/
+scripts/
+.gitignore
+.npmignore
+.env
+.env.*
+.pi/
+*.tgz

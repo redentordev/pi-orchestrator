@@ -1,0 +1,43 @@
+{
+  "name": "@redentor_dev/pi-orchestrator",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi orchestrator delegation workflow with researcher, implementor, design agents, and live per-role agents status tracking.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redentordev/pi-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/redentordev/pi-orchestrator/issues"
+  },
+  "homepage": "https://github.com/redentordev/pi-orchestrator#readme",
+  "scripts": {
+    "pack:check": "npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "extensions",
+    "agents",
+    "prompts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}
