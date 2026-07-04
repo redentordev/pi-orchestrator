@@ -18,7 +18,7 @@ It provides:
 From npm:
 
 ```bash
-pi install npm:@redentor_dev/pi-orchestrator@0.1.0
+pi install npm:@redentor_dev/pi-orchestrator
 ```
 
 ## Commands
