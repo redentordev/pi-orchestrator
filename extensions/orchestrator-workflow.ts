@@ -4,8 +4,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { getAgentDir, parseFrontmatter, renderDiff, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { getAgentDir, getSelectListTheme, getSettingsListTheme, parseFrontmatter, renderDiff, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, Input, SelectList, SettingsList, Spacer, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -53,8 +53,10 @@ interface OrchestratorRoleConfig {
 
 interface OrchestratorConfig {
   orchestrator?: OrchestratorRoleConfig;
+  enabled?: boolean;
   statusWidget?: boolean;
   statusView?: StatusView;
+  replaceFooter?: boolean;
 }
 
 interface AgentConfig {
@@ -85,6 +87,7 @@ interface DelegationDetails {
   thinking: ThinkingLevel;
   cwd: string;
   sessionId: string;
+  resume: "new" | "resumed" | "not_found";
   turns: number;
   inputTokens: number;
   outputTokens: number;
@@ -135,6 +138,7 @@ const UPDATE_THROTTLE_MS = 80;
 const ROLES: Role[] = ["orchestrator", "researcher", "implementor", "design"];
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const STATUS_VIEWS: StatusView[] = ["minimal", "default", "detailed"];
+const OUR_TOOLS = ["delegate_researcher", "delegate_implementor", "delegate_design", "review_diff"];
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
@@ -321,8 +325,10 @@ function normalizeOrchestratorConfig(value: any): OrchestratorConfig {
       thinking: isThinkingLevel(orchestrator.thinking) ? orchestrator.thinking : "medium",
     };
   }
+  if (typeof value.enabled === "boolean") config.enabled = value.enabled;
   if (typeof value.statusWidget === "boolean") config.statusWidget = value.statusWidget;
   if (isStatusView(value.statusView)) config.statusView = value.statusView;
+  if (typeof value.replaceFooter === "boolean") config.replaceFooter = value.replaceFooter;
   return config;
 }
 
@@ -336,12 +342,18 @@ function loadOrchestratorConfig(): OrchestratorConfig {
   }
 }
 
+function isSystemEnabled(config = loadOrchestratorConfig()): boolean {
+  return config.enabled !== false;
+}
+
 function saveOrchestratorConfig(patch: Partial<OrchestratorConfig>): OrchestratorConfig {
   const current = loadOrchestratorConfig();
   const next: OrchestratorConfig = { ...current };
   if (patch.orchestrator) next.orchestrator = patch.orchestrator;
+  if (typeof patch.enabled === "boolean") next.enabled = patch.enabled;
   if (typeof patch.statusWidget === "boolean") next.statusWidget = patch.statusWidget;
   if (isStatusView(patch.statusView)) next.statusView = patch.statusView;
+  if (typeof patch.replaceFooter === "boolean") next.replaceFooter = patch.replaceFooter;
   fs.mkdirSync(path.dirname(getOrchestratorConfigPath()), { recursive: true });
   fs.writeFileSync(getOrchestratorConfigPath(), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   return next;
@@ -432,9 +444,9 @@ function delegatePromptSnippet(role: AgentName, purpose: string, suffix = ""): s
   const toolName = `delegate_${role}`;
   try {
     const agent = loadAgent(role);
-    return `${toolName}: ${purpose} via ${agent.provider}/${agent.model}:${agent.thinking} (reconfigure with /agents).${suffix}`;
+    return `${toolName}: ${purpose} via ${agent.provider}/${agent.model}:${agent.thinking} (reconfigure with /team).${suffix}`;
   } catch {
-    return `${toolName}: ${purpose} via the configured ${role} model — see /agents.${suffix}`;
+    return `${toolName}: ${purpose} via the configured ${role} model — see /team.${suffix}`;
   }
 }
 
@@ -603,6 +615,22 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
+function findSubagentSessionFile(sessionDir: string, sessionId: string): string | undefined {
+  try {
+    let newest: { file: string; mtimeMs: number } | undefined;
+    for (const entry of fs.readdirSync(sessionDir)) {
+      if (!entry.endsWith(`_${sessionId}.jsonl`)) continue;
+      const file = path.join(sessionDir, entry);
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) continue;
+      if (!newest || stat.mtimeMs > newest.mtimeMs) newest = { file: path.resolve(file), mtimeMs: stat.mtimeMs };
+    }
+    return newest?.file;
+  } catch {
+    return undefined;
+  }
+}
+
 async function runDelegatedAgent(
   agentName: AgentName,
   task: string,
@@ -614,17 +642,49 @@ async function runDelegatedAgent(
   thinkingOverride?: ThinkingLevel,
 ): Promise<AgentToolResult<DelegationDetails>> {
   const agent = loadAgent(agentName);
-  const sessionId = providedSessionId || randomUUID();
   const sessionDir = path.join(getAgentDir(), "subagent-sessions");
   const effectiveThinking = thinkingOverride ?? agent.thinking;
+
+  if (providedSessionId !== undefined && !/^[0-9a-zA-Z-]{8,64}$/.test(providedSessionId)) {
+    const message = `Invalid sessionId: ${providedSessionId}. sessionId must match /^[0-9a-zA-Z-]{8,64}$/.`;
+    return {
+      content: [{ type: "text", text: message }],
+      details: {
+        agent: agent.name,
+        provider: agent.provider,
+        model: agent.model,
+        thinking: effectiveThinking,
+        cwd,
+        sessionId: providedSessionId,
+        resume: "not_found",
+        turns: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cost: 0,
+        exitCode: 1,
+        stderr: message,
+        activity: [],
+        status: "failed",
+        report: message,
+        droppedCount: 0,
+      },
+      isError: true,
+    } as AgentToolResult<DelegationDetails>;
+  }
+
+  const sessionId = providedSessionId || randomUUID();
+  const resumeSessionFile = providedSessionId ? findSubagentSessionFile(sessionDir, providedSessionId) : undefined;
+  const resume: DelegationDetails["resume"] = providedSessionId ? (resumeSessionFile ? "resumed" : "not_found") : "new";
+  const sessionArgs = resumeSessionFile ? ["--session", resumeSessionFile] : ["--session-id", sessionId];
   const args = [
     "--mode",
     "json",
     "-p",
     "--session-dir",
     sessionDir,
-    "--session-id",
-    sessionId,
+    ...sessionArgs,
     "--no-extensions",
     "--provider",
     agent.provider,
@@ -694,6 +754,7 @@ async function runDelegatedAgent(
     thinking: effectiveThinking,
     cwd,
     sessionId,
+    resume,
     turns,
     inputTokens,
     outputTokens,
@@ -855,20 +916,24 @@ async function runDelegatedAgent(
   const fallback = errorMessage || stderr.trim() || (aborted ? `${agent.name} was aborted.` : "No output returned.");
   const resultText = finalText || fallback;
   const stderrTailBlock = failed && stderr.trim() ? `\n\nStderr (tail):\n\`\`\`\n${stderr.slice(-2000)}\n\`\`\`` : "";
+  const resultWarning =
+    resume === "not_found"
+      ? `Warning: resume miss — session ${sessionId} was not found in the subagent session dir; the agent started without prior context.\n\n`
+      : "";
   const resultBody = stderrTailBlock
-    ? `${capOutput(resultText, Math.max(0, 32_000 - Buffer.byteLength(stderrTailBlock, "utf8")), "Delegation result")}${stderrTailBlock}`
-    : capOutput(resultText, 32_000, "Delegation result");
+    ? `${resultWarning}${capOutput(resultText, Math.max(0, 32_000 - Buffer.byteLength(stderrTailBlock, "utf8") - Buffer.byteLength(resultWarning, "utf8")), "Delegation result")}${stderrTailBlock}`
+    : `${resultWarning}${capOutput(resultText, Math.max(0, 32_000 - Buffer.byteLength(resultWarning, "utf8")), "Delegation result")}`;
 
   return {
     content: [
       {
         type: "text",
-        text: `${resultBody}${delegationFooter(agent.name, sessionId, turns, inputTokens, outputTokens, cacheReadTokens, cost)}`,
+        text: `${resultBody}${delegationFooter(agent.name, sessionId, resume, turns, inputTokens, outputTokens, cacheReadTokens, cost)}`,
       },
     ],
-    details: details(exitCode, failed ? "failed" : "done", finalText || undefined),
+    details: details(exitCode, failed ? "failed" : "done", finalText ? `${resultWarning}${finalText}` : undefined),
     isError: failed,
-  };
+  } as AgentToolResult<DelegationDetails>;
 }
 
 async function runGit(args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -894,6 +959,7 @@ function formatCount(value: number): string {
 function delegationFooter(
   agentName: string,
   sessionId: string,
+  resume: DelegationDetails["resume"],
   turns: number,
   inputTokens: number,
   outputTokens: number,
@@ -901,8 +967,9 @@ function delegationFooter(
   cost: number,
 ): string {
   const costSegment = cost > 0 ? ` · $${cost.toFixed(4)}` : "";
+  const resumeSegment = resume === "resumed" ? " · resumed" : resume === "not_found" ? " · ⚠ resume miss — started fresh" : "";
   const turnLabel = `${formatCount(turns)} ${turns === 1 ? "turn" : "turns"}`;
-  return `\n\n---\n[${agentName} · session ${sessionId} · ${turnLabel} · ${formatCount(inputTokens)} in / ${formatCount(outputTokens)} out · cache ${formatCount(cacheReadTokens)} read${costSegment}]`;
+  return `\n\n---\n[${agentName} · session ${sessionId}${resumeSegment} · ${turnLabel} · ${formatCount(inputTokens)} in / ${formatCount(outputTokens)} out · cache ${formatCount(cacheReadTokens)} read${costSegment}]`;
 }
 
 function capOutput(text: string, maxBytes: number, label = "Output"): string {
@@ -938,15 +1005,16 @@ function formatDelegationStats(details: DelegationDetails): string {
 
 function delegateHeader(agentLabel: string, details: DelegationDetails, theme: any): string {
   const agent = theme.fg("accent", theme.bold(agentLabel));
+  const resumeMiss = details.resume === "not_found" ? theme.fg("warning", " ⚠ resume miss") : "";
   if (details.status === "running") {
     const toolCalls = details.activity.filter((item) => item.kind === "tool").length;
     const stats = `${formatCount(details.turns)} turns · ${formatCount(toolCalls)} tool calls`;
-    return `${theme.fg("warning", "⏳")} ${agent} ${theme.fg("warning", "working…")} ${theme.fg("dim", `· ${stats}`)}`;
+    return `${theme.fg("warning", "⏳")} ${agent} ${theme.fg("warning", "working…")}${resumeMiss} ${theme.fg("dim", `· ${stats}`)}`;
   }
   const stats = formatDelegationStats(details);
   const statsText = stats ? theme.fg("dim", ` · ${stats}`) : "";
-  if (details.status === "failed") return `${theme.fg("error", "✗")} ${agent} ${theme.fg("error", "failed")}${statsText}`;
-  return `${theme.fg("success", "✓")} ${agent} ${theme.fg("success", "done")}${statsText}`;
+  if (details.status === "failed") return `${theme.fg("error", "✗")} ${agent} ${theme.fg("error", "failed")}${resumeMiss}${statsText}`;
+  return `${theme.fg("success", "✓")} ${agent} ${theme.fg("success", "done")}${resumeMiss}${statsText}`;
 }
 
 function activityLine(item: ActivityItem, theme: any): string {
@@ -1079,6 +1147,93 @@ function addReviewText(container: Container, text: string, theme: any, diff = fa
   if (spacer) container.addChild(new Spacer(1));
 }
 
+function formatCwdForTeamFooter(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  const home = process.env.HOME ? path.resolve(process.env.HOME) : "";
+  if (!home) return resolved;
+  if (resolved === home) return "~";
+  if (resolved.startsWith(`${home}${path.sep}`)) return `~/${path.relative(home, resolved).split(path.sep).join("/")}`;
+  return resolved;
+}
+
+function allToolNames(pi: any): string[] {
+  const tools = pi.getAllTools?.() ?? [];
+  return tools
+    .map((tool: any) => (typeof tool === "string" ? tool : typeof tool?.name === "string" ? tool.name : undefined))
+    .filter((name: any): name is string => typeof name === "string");
+}
+
+function makeDirectoryFooterFactory(ctx: any, getStatusView: () => StatusView) {
+  return (tui: any, theme: any, footerData: any) => {
+    const component = {
+      render(width: number): string[] {
+        const cwd = formatCwdForTeamFooter(ctx.sessionManager.getCwd());
+        const branch = footerData.getGitBranch?.();
+        const sessionName = ctx.sessionManager.getSessionName?.();
+        const leftParts = [`${cwd}${branch ? ` (${branch})` : ""}`];
+        if (sessionName) leftParts.push(sessionName);
+        const rightPlain = `● team · ${getStatusView()}`;
+        const right = `${theme.fg("accent", "● team")}${theme.fg("dim", ` · ${getStatusView()}`)}`;
+        // Prioritize the team indicator: truncate/drop the cwd side first when space is tight.
+        if (visibleWidth(rightPlain) >= width) return [truncateToWidth(right, width)];
+        const leftBudget = width - visibleWidth(rightPlain) - 1;
+        const leftPlain = truncateToWidth(leftParts.join(" · "), leftBudget);
+        const left = theme.fg("dim", leftPlain);
+        const gap = width - visibleWidth(leftPlain) - visibleWidth(rightPlain);
+        const line = gap >= 1 ? `${left}${" ".repeat(gap)}${right}` : right;
+        return [truncateToWidth(line, width)];
+      },
+      invalidate() {},
+      dispose: footerData.onBranchChange?.(() => tui.requestRender?.()),
+    };
+    return component;
+  };
+}
+
+class TeamSettingsList extends SettingsList {
+  private readonly teamOnChange: (id: string, newValue: string) => void;
+
+  constructor(
+    items: any[],
+    maxVisible: number,
+    theme: any,
+    onChange: (id: string, newValue: string) => void,
+    onCancel: () => void,
+    options?: { enableSearch?: boolean },
+  ) {
+    super(items, maxVisible, theme, onChange, onCancel, options);
+    this.teamOnChange = onChange;
+  }
+
+  /** Whether a submenu (e.g. the model picker) is currently open over the main list. */
+  hasSubmenu(): boolean {
+    return Boolean((this as any).submenuComponent);
+  }
+
+  override handleInput(data: string) {
+    if ((this as any).submenuComponent) {
+      super.handleInput(data);
+      return;
+    }
+    const direction = matchesKey(data, "right") ? 1 : matchesKey(data, "left") ? -1 : 0;
+    if (direction !== 0) {
+      const selectedIndex = (this as any).selectedIndex ?? 0;
+      const filteredItems = (this as any).filteredItems;
+      const items = (Array.isArray(filteredItems) && filteredItems.length > 0 ? filteredItems : (this as any).items) ?? [];
+      const item = items[selectedIndex];
+      if (item?.values?.length > 0) {
+        const currentIndex = Math.max(0, item.values.indexOf(item.currentValue));
+        const nextIndex = (currentIndex + direction + item.values.length) % item.values.length;
+        const nextValue = item.values[nextIndex];
+        item.currentValue = nextValue;
+        this.teamOnChange(item.id, nextValue);
+      }
+      return;
+    }
+    super.handleInput(data);
+  }
+}
+
 function makeReviewDiffRenderers() {
   return {
     renderCall(args: any, theme: any, _context: any) {
@@ -1161,7 +1316,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
 
   const getStatusView = (): StatusView => config.statusView ?? "default";
   const getActiveStatusRoles = (): Role[] => ROLES.filter((role) => hasRoleActivity(totals[role]));
-  const statusRowPrefix = (index: number): string => (index === 0 ? "agents " : "  ");
+  const statusRowPrefix = (index: number): string => (index === 0 ? "team " : "  ");
 
   const aggregateStatusTotals = (activeRoles: Role[]) => {
     let requests = 0;
@@ -1208,7 +1363,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   };
 
   const refreshStatusWidgetNow = (ctx: any) => {
-    if (config.statusWidget === false) {
+    if (!isSystemEnabled(config) || config.statusWidget === false) {
       ctx.ui.setWidget("agent-status", undefined);
       return;
     }
@@ -1223,7 +1378,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     const lines: string[] = [];
 
     if (view === "minimal") {
-      lines.push(["agents", ...compactAggregateParts(activeRoles, aggregateStatusTotals(activeRoles))].join(" · "));
+      lines.push(["team", ...compactAggregateParts(activeRoles, aggregateStatusTotals(activeRoles))].join(" · "));
     } else if (view === "detailed") {
       activeRoles.forEach((role, index) => {
         const total = totals[role];
@@ -1306,6 +1461,29 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     }
   };
 
+  const applySystemState = (ctx: any) => {
+    const enabled = isSystemEnabled(config);
+    const active = pi.getActiveTools?.() ?? [];
+    const activeNames = Array.isArray(active) ? active.filter((name: any): name is string => typeof name === "string") : [];
+
+    if (enabled) {
+      const available = new Set(allToolNames(pi));
+      const ours = OUR_TOOLS.filter((name) => available.has(name));
+      pi.setActiveTools?.([...new Set([...activeNames, ...ours])]);
+      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", "● team"));
+    } else {
+      pi.setActiveTools?.(activeNames.filter((name) => !OUR_TOOLS.includes(name)));
+      ctx.ui.setStatus("workflow", ctx.ui.theme.fg("dim", "○ team off"));
+    }
+
+    refreshStatusWidget(ctx, true);
+    if (enabled && config.statusWidget !== false && config.replaceFooter !== false) {
+      ctx.ui.setFooter?.(makeDirectoryFooterFactory(ctx, getStatusView));
+    } else {
+      ctx.ui.setFooter?.(undefined);
+    }
+  };
+
   const recordUsageDelta = (role: Role, delta: UsageDelta, ctx: any, force = false) => {
     addUsageDeltaToTotals(totals, role, delta);
     refreshStatusWidget(ctx, force || Boolean(delta.requests));
@@ -1353,6 +1531,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   };
 
   const applyConfiguredOrchestrator = async (ctx: any) => {
+    if (!isSystemEnabled(config)) return;
     const configured = config.orchestrator;
     if (!configured) return;
     const model = ctx.modelRegistry.find(configured.provider, configured.model);
@@ -1406,7 +1585,240 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     return { provider: choice.slice(0, slash), model: choice.slice(slash + 1) };
   };
 
-  const formatAgentsShow = (ctx: any): string => {
+  const parseModelValue = (value: string): { provider: string; model: string } | undefined => {
+    const slash = value.indexOf("/");
+    if (slash <= 0) return undefined;
+    return { provider: value.slice(0, slash), model: value.slice(slash + 1) };
+  };
+
+  const currentOrchestratorModel = (ctx: any): { provider: string; model: string; thinking: ThinkingLevel } => {
+    const configured = config.orchestrator;
+    return {
+      provider: ctx.model?.provider ?? configured?.provider ?? "unset",
+      model: ctx.model?.id ?? configured?.model ?? "unset",
+      thinking: (ctx.model ? pi.getThinkingLevel() : (configured?.thinking ?? pi.getThinkingLevel())) as ThinkingLevel,
+    };
+  };
+
+  const makeModelPicker = (ctx: any, currentValue: string) => {
+    const options = getModelOptions(ctx);
+    const input = new Input();
+    const selectList = new SelectList(
+      options.map((value) => ({ value, label: value })),
+      Math.min(12, Math.max(1, options.length)),
+      getSelectListTheme(),
+    );
+    const currentIndex = options.indexOf(currentValue);
+    if (currentIndex >= 0) selectList.setSelectedIndex(currentIndex);
+    return (done: (selectedValue?: string) => void) => {
+      selectList.onSelect = (item) => done(item.value);
+      selectList.onCancel = () => done(undefined);
+      return {
+        render(width: number): string[] {
+          return [
+            ...input.render(width),
+            ctx.ui.theme.fg("dim", "  Type to filter · ↑/↓ select · Enter choose · Esc cancel"),
+            "",
+            ...selectList.render(width),
+          ];
+        },
+        invalidate() {},
+        handleInput(data: string) {
+          if (
+            matchesKey(data, "up") ||
+            matchesKey(data, "down") ||
+            matchesKey(data, "enter") ||
+            matchesKey(data, "return") ||
+            matchesKey(data, "escape")
+          ) {
+            selectList.handleInput(data);
+            return;
+          }
+          input.handleInput(data);
+          selectList.setFilter(input.getValue());
+        },
+      };
+    };
+  };
+
+  const runLegacyTeamFlow = async (ctx: any) => {
+    const role = (await ctx.ui.select("Configure which role?", ["orchestrator", "researcher", "implementor", "design"])) as Role | undefined;
+    if (!role) return;
+    const selected = await selectModel(ctx);
+    if (!selected) return;
+    const thinking = (await ctx.ui.select("Thinking level", THINKING_LEVELS)) as ThinkingLevel | undefined;
+    if (!thinking) return;
+
+    if (role === "orchestrator") {
+      const model = ctx.modelRegistry.find(selected.provider, selected.model);
+      if (!model) {
+        ctx.ui.notify(`Model not found: ${selected.provider}/${selected.model}`, "error");
+        return;
+      }
+      const ok = await pi.setModel(model);
+      if (!ok) {
+        ctx.ui.notify(`No configured auth for ${selected.provider}/${selected.model}; model not changed.`, "error");
+        return;
+      }
+      pi.setThinkingLevel(thinking);
+      config = saveOrchestratorConfig({ orchestrator: { provider: selected.provider, model: selected.model, thinking } });
+      ctx.ui.notify(`orchestrator set to ${selected.provider}/${selected.model}:${thinking}`, "info");
+      return;
+    }
+
+    updateAgentFrontmatter(role, { provider: selected.provider, model: selected.model, thinking });
+    ctx.ui.notify(`${role} set to ${selected.provider}/${selected.model}:${thinking}; applies to the next delegation.`, "info");
+  };
+
+  const openTeamPanel = async (ctx: any) => {
+    const orchestrator = currentOrchestratorModel(ctx);
+    const researcher = loadAgent("researcher");
+    const implementor = loadAgent("implementor");
+    const design = loadAgent("design");
+    const items: any[] = [
+      {
+        id: "system",
+        label: "System",
+        description: "Master switch: tools, prompt injection, widget, footer",
+        currentValue: isSystemEnabled(config) ? "on" : "off",
+        values: ["on", "off"],
+      },
+      {
+        id: "orchestrator.model",
+        label: "Orchestrator model",
+        currentValue: `${orchestrator.provider}/${orchestrator.model}`,
+        submenu: (currentValue: string, done: (selectedValue?: string) => void) => makeModelPicker(ctx, currentValue)(done),
+      },
+      {
+        id: "orchestrator.thinking",
+        label: "Orchestrator thinking",
+        currentValue: orchestrator.thinking,
+        values: THINKING_LEVELS,
+      },
+      ...(["researcher", "implementor", "design"] as AgentName[]).flatMap((role) => {
+        const agent = role === "researcher" ? researcher : role === "implementor" ? implementor : design;
+        const roleLabel = `${role[0].toUpperCase()}${role.slice(1)}`;
+        return [
+          {
+            id: `${role}.model`,
+            label: `${roleLabel} model`,
+            currentValue: `${agent.provider}/${agent.model}`,
+            submenu: (currentValue: string, done: (selectedValue?: string) => void) => makeModelPicker(ctx, currentValue)(done),
+          },
+          {
+            id: `${role}.thinking`,
+            label: `${roleLabel} thinking`,
+            currentValue: agent.thinking,
+            values: THINKING_LEVELS,
+          },
+        ];
+      }),
+      { id: "statusWidget", label: "Status widget", currentValue: config.statusWidget === false ? "off" : "on", values: ["on", "off"] },
+      { id: "statusView", label: "Status detail", currentValue: getStatusView(), values: STATUS_VIEWS },
+      {
+        id: "footer",
+        label: "Footer",
+        description: "directory = replace pi footer with cwd-only line while status widget is on",
+        currentValue: config.replaceFooter === false ? "built-in" : "directory",
+        values: ["directory", "built-in"],
+      },
+    ];
+
+    await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: (value?: unknown) => void) => {
+      let list: TeamSettingsList;
+      const revert = (id: string, value: string) => list.updateValue(id, value);
+      const onChange = (id: string, value: string) => {
+        if (id === "system") {
+          config = saveOrchestratorConfig({ enabled: value === "on" });
+          applySystemState(ctx);
+          if (value === "on") void applyConfiguredOrchestrator(ctx);
+          return;
+        }
+        if (id === "orchestrator.model") {
+          const previous = currentOrchestratorModel(ctx);
+          const selected = parseModelValue(value);
+          if (!selected) {
+            ctx.ui.notify(`Invalid model: ${value}`, "error");
+            revert(id, `${previous.provider}/${previous.model}`);
+            return;
+          }
+          const model = ctx.modelRegistry.find(selected.provider, selected.model);
+          if (!model) {
+            ctx.ui.notify(`Model not found: ${selected.provider}/${selected.model}`, "error");
+            revert(id, `${previous.provider}/${previous.model}`);
+            return;
+          }
+          pi.setModel(model).then((ok: boolean) => {
+            if (!ok) {
+              ctx.ui.notify(`No configured auth for ${selected.provider}/${selected.model}; model not changed.`, "error");
+              revert(id, `${previous.provider}/${previous.model}`);
+              tui.requestRender();
+              return;
+            }
+            config = saveOrchestratorConfig({ orchestrator: { provider: selected.provider, model: selected.model, thinking: pi.getThinkingLevel() } });
+            tui.requestRender();
+          });
+          return;
+        }
+        if (id === "orchestrator.thinking") {
+          const current = currentOrchestratorModel(ctx);
+          pi.setThinkingLevel(value as ThinkingLevel);
+          config = saveOrchestratorConfig({ orchestrator: { provider: current.provider, model: current.model, thinking: value as ThinkingLevel } });
+          return;
+        }
+        for (const role of ["researcher", "implementor", "design"] as AgentName[]) {
+          if (id === `${role}.model`) {
+            const previous = loadAgent(role);
+            const selected = parseModelValue(value);
+            if (!selected) {
+              ctx.ui.notify(`Invalid model: ${value}`, "error");
+              revert(id, `${previous.provider}/${previous.model}`);
+              return;
+            }
+            updateAgentFrontmatter(role, { provider: selected.provider, model: selected.model, thinking: previous.thinking });
+            return;
+          }
+          if (id === `${role}.thinking`) {
+            const agent = loadAgent(role);
+            updateAgentFrontmatter(role, { provider: agent.provider, model: agent.model, thinking: value as ThinkingLevel });
+            return;
+          }
+        }
+        if (id === "statusWidget") {
+          config = saveOrchestratorConfig({ statusWidget: value === "on" });
+          applySystemState(ctx);
+          return;
+        }
+        if (id === "statusView") {
+          config = saveOrchestratorConfig({ statusView: value as StatusView });
+          applySystemState(ctx);
+          return;
+        }
+        if (id === "footer") {
+          config = saveOrchestratorConfig({ replaceFooter: value === "directory" });
+          applySystemState(ctx);
+        }
+      };
+      list = new TeamSettingsList(items, Math.min(18, items.length + 2), getSettingsListTheme(), onChange, () => done(undefined), {
+        enableSearch: false,
+      });
+      return {
+        render(width: number): string[] {
+          const hint = list.hasSubmenu() ? "" : ` ${theme.fg("dim", "↑/↓ select · ←/→ cycle value")}`;
+          return [`${theme.fg("accent", theme.bold("Team"))}${hint}`, "", ...list.render(width)];
+        },
+        invalidate() {
+          list.invalidate();
+        },
+        handleInput(data: string) {
+          list.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    });
+  };
+
+  const formatTeamShow = (ctx: any): string => {
     const configured = config.orchestrator;
     const orchestratorProvider = ctx.model?.provider ?? configured?.provider ?? "unset";
     const orchestratorModel = ctx.model?.id ?? configured?.model ?? "unset";
@@ -1414,19 +1826,17 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     const researcher = loadAgent("researcher");
     const implementor = loadAgent("implementor");
     const design = loadAgent("design");
+    const widget = config.statusWidget === false || !isSystemEnabled(config) ? `off (${getStatusView()})` : getStatusView();
+    const footer = isSystemEnabled(config) && config.statusWidget !== false && config.replaceFooter !== false ? "directory" : "built-in";
     return [
+      `team ${isSystemEnabled(config) ? "on" : "off"}`,
+      `status ${widget}`,
+      `footer ${footer}`,
       `orchestrator ${orchestratorProvider}/${orchestratorModel}:${orchestratorThinking}`,
       `researcher ${researcher.provider}/${researcher.model}:${researcher.thinking}`,
       `implementor ${implementor.provider}/${implementor.model}:${implementor.thinking}`,
       `design ${design.provider}/${design.model}:${design.thinking}`,
     ].join(" · ");
-  };
-
-  const formatStatusSummary = (): string => {
-    const activeRoles = getActiveStatusRoles();
-    const mode = config.statusWidget === false ? `off (${getStatusView()})` : getStatusView();
-    if (activeRoles.length === 0) return ["agents", mode, "no activity"].join(" · ");
-    return ["agents", mode, ...compactAggregateParts(activeRoles, aggregateStatusTotals(activeRoles))].join(" · ");
   };
 
   pi.registerTool({
@@ -1630,104 +2040,59 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     ...makeReviewDiffRenderers(),
   });
 
-  pi.registerCommand("agents-status", {
-    description: "Configure the live agents status widget",
+  pi.registerCommand("team", {
+    description: "Team settings: models, thinking, status widget, on/off",
     getArgumentCompletions: (prefix) => {
-      const values = [...STATUS_VIEWS, "off", "on", "show", "reset"];
+      const values = ["show", "on", "off", "reset", ...STATUS_VIEWS];
       const filtered = values.filter((value) => value.startsWith((prefix || "").trim()));
       return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
     },
     handler: async (args, ctx) => {
       const action = (args || "").trim();
-      if (isStatusView(action)) {
-        config = saveOrchestratorConfig({ statusView: action, statusWidget: true });
-        refreshStatusWidget(ctx, true);
-        ctx.ui.notify(`Agents status view set to ${action}.`, "info");
-        return;
-      }
-      if (action === "off") {
-        config = saveOrchestratorConfig({ statusWidget: false });
-        refreshStatusWidget(ctx, true);
-        ctx.ui.notify("Agents status widget disabled.", "info");
+      if (action === "show") {
+        ctx.ui.notify(formatTeamShow(ctx), "info");
         return;
       }
       if (action === "on") {
-        config = saveOrchestratorConfig({ statusWidget: true });
-        refreshStatusWidget(ctx, true);
-        ctx.ui.notify(`Agents status widget enabled (${getStatusView()}).`, "info");
+        config = saveOrchestratorConfig({ enabled: true });
+        applySystemState(ctx);
+        await applyConfiguredOrchestrator(ctx);
+        ctx.ui.notify("Team orchestration enabled.", "info");
         return;
       }
-      if (action === "show") {
-        ctx.ui.notify(formatStatusSummary(), "info");
+      if (action === "off") {
+        config = saveOrchestratorConfig({ enabled: false });
+        applySystemState(ctx);
+        ctx.ui.notify("Team orchestration disabled.", "info");
+        return;
+      }
+      if (isStatusView(action)) {
+        config = saveOrchestratorConfig({ statusView: action, statusWidget: true });
+        applySystemState(ctx);
+        ctx.ui.notify(`Team status view set to ${action}.`, "info");
         return;
       }
       if (action === "reset") {
         resetTotals(totals);
         refreshStatusWidget(ctx, true);
-        ctx.ui.notify("Agents status totals reset.", "info");
+        ctx.ui.notify("Team status totals reset.", "info");
         return;
       }
       if (action) {
-        ctx.ui.notify(`Unknown /agents-status argument: ${action}`, "error");
+        ctx.ui.notify(`Unknown /team argument: ${action}`, "error");
         return;
       }
 
-      const currentIndex = STATUS_VIEWS.indexOf(getStatusView());
-      const nextView = STATUS_VIEWS[(currentIndex + 1) % STATUS_VIEWS.length];
-      config = saveOrchestratorConfig({ statusView: nextView, statusWidget: true });
-      refreshStatusWidget(ctx, true);
-      ctx.ui.notify(`Agents status view set to ${nextView}.`, "info");
-    },
-  });
-
-  pi.registerCommand("agents", {
-    description: "Configure per-role provider, model, and thinking level",
-    getArgumentCompletions: (prefix) => {
-      const values = ["show"];
-      const filtered = values.filter((value) => value.startsWith((prefix || "").trim()));
-      return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
-    },
-    handler: async (args, ctx) => {
-      const action = (args || "").trim();
-      if (action === "show") {
-        ctx.ui.notify(formatAgentsShow(ctx), "info");
+      if (ctx.mode !== "tui") {
+        await runLegacyTeamFlow(ctx);
         return;
       }
-      if (action) {
-        ctx.ui.notify(`Unknown /agents argument: ${action}`, "error");
-        return;
-      }
-
-      const role = (await ctx.ui.select("Configure which role?", ["orchestrator", "researcher", "implementor", "design"])) as Role | undefined;
-      if (!role) return;
-      const selected = await selectModel(ctx);
-      if (!selected) return;
-      const thinking = (await ctx.ui.select("Thinking level", THINKING_LEVELS)) as ThinkingLevel | undefined;
-      if (!thinking) return;
-
-      if (role === "orchestrator") {
-        const model = ctx.modelRegistry.find(selected.provider, selected.model);
-        if (!model) {
-          ctx.ui.notify(`Model not found: ${selected.provider}/${selected.model}`, "error");
-          return;
-        }
-        const ok = await pi.setModel(model);
-        if (!ok) {
-          ctx.ui.notify(`No configured auth for ${selected.provider}/${selected.model}; model not changed.`, "error");
-          return;
-        }
-        pi.setThinkingLevel(thinking);
-        config = saveOrchestratorConfig({ orchestrator: { provider: selected.provider, model: selected.model, thinking } });
-        ctx.ui.notify(`orchestrator set to ${selected.provider}/${selected.model}:${thinking}`, "info");
-        return;
-      }
-
-      updateAgentFrontmatter(role, { provider: selected.provider, model: selected.model, thinking });
-      ctx.ui.notify(`${role} set to ${selected.provider}/${selected.model}:${thinking}; applies to the next delegation.`, "info");
+      await openTeamPanel(ctx);
     },
   });
 
   pi.on("before_agent_start", async (event) => {
+    if (!isSystemEnabled(config)) return;
     const prompt = loadBundledOrchestratorPrompt();
     if (!prompt) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
@@ -1756,12 +2121,11 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("workflow", "orchestrator");
     config = loadOrchestratorConfig();
     orchestratorUsageSnapshot = undefined;
     rebuildTotalsFromSession(ctx);
+    applySystemState(ctx);
     await applyConfiguredOrchestrator(ctx);
-    refreshStatusWidget(ctx, true);
   });
 
   pi.on("session_shutdown", async () => {
