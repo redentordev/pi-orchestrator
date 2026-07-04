@@ -5,11 +5,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { getAgentDir, getSelectListTheme, getSettingsListTheme, parseFrontmatter, renderDiff, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Input, SelectList, SettingsList, Spacer, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Input, SelectList, SettingsList, Spacer, Text, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type StatusView = "minimal" | "default" | "detailed";
+type ExecutionMode = "parallel" | "sequential";
 
 type AgentName = "researcher" | "implementor" | "design";
 type Role = "orchestrator" | "researcher" | "implementor" | "design";
@@ -65,6 +66,7 @@ interface AgentConfig {
   provider: string;
   model: string;
   thinking: ThinkingLevel;
+  execution: ExecutionMode;
   tools: string[];
   systemPrompt: string;
   billing?: BillingOverride;
@@ -138,6 +140,7 @@ const UPDATE_THROTTLE_MS = 80;
 const ROLES: Role[] = ["orchestrator", "researcher", "implementor", "design"];
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const STATUS_VIEWS: StatusView[] = ["minimal", "default", "detailed"];
+const EXECUTION_MODES: ExecutionMode[] = ["parallel", "sequential"];
 const OUR_TOOLS = ["delegate_researcher", "delegate_implementor", "delegate_design", "review_diff"];
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
@@ -146,6 +149,14 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 
 function isStatusView(value: unknown): value is StatusView {
   return typeof value === "string" && STATUS_VIEWS.includes(value as StatusView);
+}
+
+function isExecutionMode(value: unknown): value is ExecutionMode {
+  return typeof value === "string" && EXECUTION_MODES.includes(value as ExecutionMode);
+}
+
+function defaultExecutionMode(role: AgentName): ExecutionMode {
+  return role === "researcher" ? "parallel" : "sequential";
 }
 
 function isBillingOverride(value: unknown): value is BillingOverride {
@@ -373,7 +384,10 @@ function ensureUserAgentFile(role: AgentName): string {
   return filePath;
 }
 
-function updateAgentFrontmatter(role: AgentName, updates: { provider: string; model: string; thinking: ThinkingLevel }) {
+function updateAgentFrontmatter(
+  role: AgentName,
+  updates: { provider: string; model: string; thinking: ThinkingLevel; execution: ExecutionMode },
+) {
   const filePath = ensureUserAgentFile(role);
   const content = fs.readFileSync(filePath, "utf8");
   const match = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/);
@@ -400,6 +414,8 @@ function loadAgent(name: AgentName): AgentConfig {
   const provider = frontmatter.provider?.trim();
   const model = frontmatter.model?.trim();
   const thinking = (frontmatter.thinking?.trim() || "medium") as ThinkingLevel;
+  const executionValue = frontmatter.execution?.trim();
+  const execution = isExecutionMode(executionValue) ? executionValue : defaultExecutionMode(name);
   const billingValue = frontmatter.billing?.trim();
   const billing = isBillingOverride(billingValue) ? billingValue : undefined;
   const tools = (frontmatter.tools || "")
@@ -417,10 +433,53 @@ function loadAgent(name: AgentName): AgentConfig {
     provider,
     model,
     thinking,
+    execution,
     tools,
     systemPrompt: body.trim(),
     billing,
   };
+}
+
+let sequentialChain: Promise<void> = Promise.resolve();
+
+function abortError(): Error {
+  return new Error("Tool call was aborted before queued execution started.");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined) {
+  if (signal?.aborted) throw abortError();
+}
+
+function runExclusive<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const previous = sequentialChain;
+  let started = false;
+
+  const run = previous.catch(() => undefined).then(async () => {
+    throwIfAborted(signal);
+    started = true;
+    return fn();
+  });
+
+  sequentialChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+
+  if (!signal) return run;
+  if (signal.aborted && !started) return Promise.reject(abortError());
+
+  let abortListener: (() => void) | undefined;
+  const abortWhileQueued = new Promise<never>((_resolve, reject) => {
+    abortListener = () => {
+      if (!started) reject(abortError());
+    };
+    signal.addEventListener("abort", abortListener, { once: true });
+    if (signal.aborted) abortListener();
+  });
+
+  return Promise.race([run, abortWhileQueued]).finally(() => {
+    if (abortListener) signal.removeEventListener("abort", abortListener);
+  });
 }
 
 let bundledOrchestratorPromptCache: string | null | undefined;
@@ -1203,6 +1262,7 @@ class TeamSettingsList extends SettingsList {
   ) {
     super(items, maxVisible, theme, onChange, onCancel, options);
     this.teamOnChange = onChange;
+    this.ensureSelectableSelection(1);
   }
 
   /** Whether a submenu (e.g. the model picker) is currently open over the main list. */
@@ -1210,17 +1270,162 @@ class TeamSettingsList extends SettingsList {
     return Boolean((this as any).submenuComponent);
   }
 
+  private isHeaderItem(item: any): boolean {
+    return Boolean(item?.header);
+  }
+
+  private displayItems(): any[] {
+    const searchEnabled = Boolean((this as any).searchEnabled);
+    const filteredItems = (this as any).filteredItems;
+    const items = (this as any).items;
+    return searchEnabled && Array.isArray(filteredItems) ? filteredItems : Array.isArray(items) ? items : [];
+  }
+
+  private ensureSelectableSelection(direction: 1 | -1 = 1) {
+    const items = this.displayItems();
+    if (items.length === 0) return;
+    let index = Math.max(0, Math.min((this as any).selectedIndex ?? 0, items.length - 1));
+    if (!this.isHeaderItem(items[index])) {
+      (this as any).selectedIndex = index;
+      return;
+    }
+    for (let offset = 1; offset <= items.length; offset += 1) {
+      const candidate = (index + offset * direction + items.length) % items.length;
+      if (!this.isHeaderItem(items[candidate])) {
+        (this as any).selectedIndex = candidate;
+        return;
+      }
+    }
+    (this as any).selectedIndex = 0;
+  }
+
+  private moveSelection(direction: 1 | -1) {
+    const items = this.displayItems();
+    if (items.length === 0) return;
+    let index = (this as any).selectedIndex ?? 0;
+    for (let step = 0; step < items.length; step += 1) {
+      index = (index + direction + items.length) % items.length;
+      if (!this.isHeaderItem(items[index])) {
+        (this as any).selectedIndex = index;
+        return;
+      }
+    }
+  }
+
+  private addTeamHintLine(lines: string[], width: number) {
+    const theme = (this as any).theme;
+    const searchEnabled = Boolean((this as any).searchEnabled);
+    lines.push("");
+    lines.push(
+      truncateToWidth(
+        theme.hint(searchEnabled ? "  Type to search · Enter/Space to change · Esc to cancel" : "  Enter/Space to change · Esc to cancel"),
+        width,
+      ),
+    );
+  }
+
+  override render(width: number): string[] {
+    if ((this as any).submenuComponent) return super.render(width);
+
+    const theme = (this as any).theme;
+    const lines: string[] = [];
+    const searchEnabled = Boolean((this as any).searchEnabled);
+    const searchInput = (this as any).searchInput;
+    const allItems = Array.isArray((this as any).items) ? (this as any).items : [];
+
+    if (searchEnabled && searchInput) {
+      lines.push(...searchInput.render(width));
+      lines.push("");
+    }
+
+    if (allItems.length === 0) {
+      lines.push(theme.hint("  No settings available"));
+      if (searchEnabled) this.addTeamHintLine(lines, width);
+      return lines;
+    }
+
+    const displayItems = this.displayItems();
+    if (displayItems.length === 0) {
+      lines.push(truncateToWidth(theme.hint("  No matching settings"), width));
+      this.addTeamHintLine(lines, width);
+      return lines;
+    }
+
+    this.ensureSelectableSelection(1);
+    const selectedIndex = (this as any).selectedIndex ?? 0;
+    const maxVisible = (this as any).maxVisible ?? displayItems.length;
+    const startIndex = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayItems.length - maxVisible));
+    const endIndex = Math.min(startIndex + maxVisible, displayItems.length);
+    const selectableLabels = allItems.filter((item: any) => !this.isHeaderItem(item)).map((item: any) => visibleWidth(item.label));
+    const maxLabelWidth = Math.min(30, Math.max(...(selectableLabels.length > 0 ? selectableLabels : [0])));
+
+    let renderedAny = false;
+    for (let i = startIndex; i < endIndex; i += 1) {
+      const item = displayItems[i];
+      if (!item) continue;
+      if (this.isHeaderItem(item)) {
+        if (renderedAny) lines.push("");
+        lines.push(truncateToWidth(theme.description(`  ${item.label}`), width));
+        renderedAny = true;
+        continue;
+      }
+
+      const isSelected = i === selectedIndex;
+      const prefix = isSelected ? theme.cursor : "  ";
+      const prefixWidth = visibleWidth(prefix);
+      const labelPadded = item.label + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+      const labelText = theme.label(labelPadded, isSelected);
+      const separator = "  ";
+      const usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator);
+      const valueMaxWidth = width - usedWidth - 2;
+      const valueText = theme.value(truncateToWidth(item.currentValue, valueMaxWidth, ""), isSelected);
+      lines.push(truncateToWidth(prefix + labelText + separator + valueText, width));
+      renderedAny = true;
+    }
+
+    if (startIndex > 0 || endIndex < displayItems.length) {
+      const scrollText = `  (${selectedIndex + 1}/${displayItems.length})`;
+      lines.push(theme.hint(truncateToWidth(scrollText, width - 2, "")));
+    }
+
+    const selectedItem = displayItems[selectedIndex];
+    if (selectedItem?.description && !this.isHeaderItem(selectedItem)) {
+      lines.push("");
+      const wrappedDesc = wrapTextWithAnsi(selectedItem.description, width - 4);
+      for (const line of wrappedDesc) {
+        lines.push(theme.description(`  ${line}`));
+      }
+    }
+
+    this.addTeamHintLine(lines, width);
+    return lines;
+  }
+
   override handleInput(data: string) {
     if ((this as any).submenuComponent) {
       super.handleInput(data);
       return;
     }
+
+    if (matchesKey(data, "up")) {
+      this.moveSelection(-1);
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.moveSelection(1);
+      return;
+    }
+
+    this.ensureSelectableSelection(1);
+    const items = this.displayItems();
+    const selectedIndex = (this as any).selectedIndex ?? 0;
+    const item = items[selectedIndex];
+    if (this.isHeaderItem(item)) {
+      if (matchesKey(data, "right") || matchesKey(data, "left") || matchesKey(data, "enter") || matchesKey(data, "return") || data === " ") return;
+    }
+
     const direction = matchesKey(data, "right") ? 1 : matchesKey(data, "left") ? -1 : 0;
     if (direction !== 0) {
-      const selectedIndex = (this as any).selectedIndex ?? 0;
-      const filteredItems = (this as any).filteredItems;
-      const items = (Array.isArray(filteredItems) && filteredItems.length > 0 ? filteredItems : (this as any).items) ?? [];
-      const item = items[selectedIndex];
       if (item?.values?.length > 0) {
         const currentIndex = Math.max(0, item.values.indexOf(item.currentValue));
         const nextIndex = (currentIndex + direction + item.values.length) % item.values.length;
@@ -1230,7 +1435,9 @@ class TeamSettingsList extends SettingsList {
       }
       return;
     }
+
     super.handleInput(data);
+    this.ensureSelectableSelection(1);
   }
 }
 
@@ -1666,8 +1873,11 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       return;
     }
 
-    updateAgentFrontmatter(role, { provider: selected.provider, model: selected.model, thinking });
-    ctx.ui.notify(`${role} set to ${selected.provider}/${selected.model}:${thinking}; applies to the next delegation.`, "info");
+    const agentRole = role as AgentName;
+    const current = loadAgent(agentRole);
+    const execution = ((await ctx.ui.select("Execution mode", EXECUTION_MODES)) as ExecutionMode | undefined) ?? current.execution;
+    updateAgentFrontmatter(agentRole, { provider: selected.provider, model: selected.model, thinking, execution });
+    ctx.ui.notify(`${role} set to ${selected.provider}/${selected.model}:${thinking}·${execution}; applies to the next delegation.`, "info");
   };
 
   const openTeamPanel = async (ctx: any) => {
@@ -1675,6 +1885,28 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     const researcher = loadAgent("researcher");
     const implementor = loadAgent("implementor");
     const design = loadAgent("design");
+    const roleHeader = (label: string) => ({ id: `header:${label.toLowerCase()}`, header: true, label, currentValue: "" });
+    const roleItems = (role: AgentName, agent: AgentConfig) => [
+      roleHeader(`${role[0].toUpperCase()}${role.slice(1)}`),
+      {
+        id: `${role}.model`,
+        label: "Model",
+        currentValue: `${agent.provider}/${agent.model}`,
+        submenu: (currentValue: string, done: (selectedValue?: string) => void) => makeModelPicker(ctx, currentValue)(done),
+      },
+      {
+        id: `${role}.thinking`,
+        label: "Thinking",
+        currentValue: agent.thinking,
+        values: THINKING_LEVELS,
+      },
+      {
+        id: `${role}.execution`,
+        label: "Execution",
+        currentValue: agent.execution,
+        values: EXECUTION_MODES,
+      },
+    ];
     const items: any[] = [
       {
         id: "system",
@@ -1683,36 +1915,23 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         currentValue: isSystemEnabled(config) ? "on" : "off",
         values: ["on", "off"],
       },
+      roleHeader("Orchestrator"),
       {
         id: "orchestrator.model",
-        label: "Orchestrator model",
+        label: "Model",
         currentValue: `${orchestrator.provider}/${orchestrator.model}`,
         submenu: (currentValue: string, done: (selectedValue?: string) => void) => makeModelPicker(ctx, currentValue)(done),
       },
       {
         id: "orchestrator.thinking",
-        label: "Orchestrator thinking",
+        label: "Thinking",
         currentValue: orchestrator.thinking,
         values: THINKING_LEVELS,
       },
-      ...(["researcher", "implementor", "design"] as AgentName[]).flatMap((role) => {
-        const agent = role === "researcher" ? researcher : role === "implementor" ? implementor : design;
-        const roleLabel = `${role[0].toUpperCase()}${role.slice(1)}`;
-        return [
-          {
-            id: `${role}.model`,
-            label: `${roleLabel} model`,
-            currentValue: `${agent.provider}/${agent.model}`,
-            submenu: (currentValue: string, done: (selectedValue?: string) => void) => makeModelPicker(ctx, currentValue)(done),
-          },
-          {
-            id: `${role}.thinking`,
-            label: `${roleLabel} thinking`,
-            currentValue: agent.thinking,
-            values: THINKING_LEVELS,
-          },
-        ];
-      }),
+      ...roleItems("researcher", researcher),
+      ...roleItems("implementor", implementor),
+      ...roleItems("design", design),
+      roleHeader("Display"),
       { id: "statusWidget", label: "Status widget", currentValue: config.statusWidget === false ? "off" : "on", values: ["on", "off"] },
       { id: "statusView", label: "Status detail", currentValue: getStatusView(), values: STATUS_VIEWS },
       {
@@ -1775,12 +1994,24 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
               revert(id, `${previous.provider}/${previous.model}`);
               return;
             }
-            updateAgentFrontmatter(role, { provider: selected.provider, model: selected.model, thinking: previous.thinking });
+            updateAgentFrontmatter(role, {
+              provider: selected.provider,
+              model: selected.model,
+              thinking: previous.thinking,
+              execution: previous.execution,
+            });
             return;
           }
           if (id === `${role}.thinking`) {
             const agent = loadAgent(role);
-            updateAgentFrontmatter(role, { provider: agent.provider, model: agent.model, thinking: value as ThinkingLevel });
+            updateAgentFrontmatter(role, { provider: agent.provider, model: agent.model, thinking: value as ThinkingLevel, execution: agent.execution });
+            return;
+          }
+          if (id === `${role}.execution`) {
+            const agent = loadAgent(role);
+            const execution = isExecutionMode(value) ? value : agent.execution;
+            updateAgentFrontmatter(role, { provider: agent.provider, model: agent.model, thinking: agent.thinking, execution });
+            ctx.ui.notify(`${role} execution set to ${execution}; applies to the next delegation.`, "info");
             return;
           }
         }
@@ -1833,10 +2064,35 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       `status ${widget}`,
       `footer ${footer}`,
       `orchestrator ${orchestratorProvider}/${orchestratorModel}:${orchestratorThinking}`,
-      `researcher ${researcher.provider}/${researcher.model}:${researcher.thinking}`,
-      `implementor ${implementor.provider}/${implementor.model}:${implementor.thinking}`,
-      `design ${design.provider}/${design.model}:${design.thinking}`,
+      `researcher ${researcher.provider}/${researcher.model}:${researcher.thinking}·${researcher.execution}`,
+      `implementor ${implementor.provider}/${implementor.model}:${implementor.thinking}·${implementor.execution}`,
+      `design ${design.provider}/${design.model}:${design.thinking}·${design.execution}`,
     ].join(" · ");
+  };
+
+  const executeDelegation = async (
+    role: AgentName,
+    params: any,
+    signal: AbortSignal | undefined,
+    onUpdate: ((partial: AgentToolResult<DelegationDetails>) => void) | undefined,
+    ctx: any,
+  ) => {
+    const run = async () => {
+      throwIfAborted(signal);
+      const result = await runDelegatedAgent(
+        role,
+        params.task,
+        params.cwd || ctx.cwd,
+        signal,
+        onUpdate,
+        (delta) => recordUsageDelta(role, delta, ctx),
+        params.sessionId,
+        params.thinking as ThinkingLevel | undefined,
+      );
+      refreshStatusWidget(ctx, true);
+      return result;
+    };
+    return loadAgent(role).execution === "sequential" ? runExclusive(run, signal) : run();
   };
 
   pi.registerTool({
@@ -1852,18 +2108,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     parameters: delegateParams,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const result = await runDelegatedAgent(
-        "researcher",
-        params.task,
-        params.cwd || ctx.cwd,
-        signal,
-        onUpdate,
-        (delta) => recordUsageDelta("researcher", delta, ctx),
-        params.sessionId,
-        params.thinking as ThinkingLevel | undefined,
-      );
-      refreshStatusWidget(ctx, true);
-      return result;
+      return executeDelegation("researcher", params, signal, onUpdate, ctx);
     },
     ...makeDelegateRenderers("Researcher"),
   });
@@ -1879,20 +2124,9 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       "For follow-up fixes or the next milestone of the same work, pass the previous delegation's sessionId to delegate_implementor to continue with retained context.",
     ],
     parameters: delegateParams,
-    executionMode: "sequential",
+    executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const result = await runDelegatedAgent(
-        "implementor",
-        params.task,
-        params.cwd || ctx.cwd,
-        signal,
-        onUpdate,
-        (delta) => recordUsageDelta("implementor", delta, ctx),
-        params.sessionId,
-        params.thinking as ThinkingLevel | undefined,
-      );
-      refreshStatusWidget(ctx, true);
-      return result;
+      return executeDelegation("implementor", params, signal, onUpdate, ctx);
     },
     ...makeDelegateRenderers("Implementor"),
   });
@@ -1907,20 +2141,9 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       "After UI-affecting implementation passes review_diff, run delegate_design scoped to the changed surface, then review_diff again. Skip it for changes with no UI impact.",
     ],
     parameters: delegateParams,
-    executionMode: "sequential",
+    executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const result = await runDelegatedAgent(
-        "design",
-        params.task,
-        params.cwd || ctx.cwd,
-        signal,
-        onUpdate,
-        (delta) => recordUsageDelta("design", delta, ctx),
-        params.sessionId,
-        params.thinking as ThinkingLevel | undefined,
-      );
-      refreshStatusWidget(ctx, true);
-      return result;
+      return executeDelegation("design", params, signal, onUpdate, ctx);
     },
     ...makeDelegateRenderers("Design"),
   });
@@ -1932,9 +2155,11 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       "Collect git status plus a combined staged+unstaged diff against HEAD and untracked file contents for orchestrator review, with an optional paths filter.",
     promptSnippet: "review_diff: inspect git status and combined diff before final orchestrator review.",
     parameters: diffParams,
-    executionMode: "sequential",
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const cwd = params.cwd || ctx.cwd;
+    executionMode: "parallel",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      return runExclusive(async () => {
+        throwIfAborted(signal);
+        const cwd = params.cwd || ctx.cwd;
       const paths = Array.isArray(params.paths)
         ? params.paths.filter((pathspec: unknown): pathspec is string => typeof pathspec === "string" && pathspec.length > 0)
         : [];
@@ -2026,22 +2251,23 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         },
         maxBytes,
       );
-      return {
-        content: [{ type: "text", text: cappedOutput }],
-        details: {
-          cwd,
-          status: status.stdout,
-          truncated: Buffer.byteLength(output, "utf8") > maxBytes,
-          output: cappedOutput,
-          sections: sectionDetails,
-        },
-      };
+        return {
+          content: [{ type: "text", text: cappedOutput }],
+          details: {
+            cwd,
+            status: status.stdout,
+            truncated: Buffer.byteLength(output, "utf8") > maxBytes,
+            output: cappedOutput,
+            sections: sectionDetails,
+          },
+        };
+      }, signal);
     },
     ...makeReviewDiffRenderers(),
   });
 
   pi.registerCommand("team", {
-    description: "Team settings: models, thinking, status widget, on/off",
+    description: "Team settings: models, thinking, execution, status widget, on/off",
     getArgumentCompletions: (prefix) => {
       const values = ["show", "on", "off", "reset", ...STATUS_VIEWS];
       const filtered = values.filter((value) => value.startsWith((prefix || "").trim()));

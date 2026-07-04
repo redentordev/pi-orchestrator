@@ -9,7 +9,7 @@ Design: reviews and fixes UI/UX, accessibility, interaction, and visual polish i
 
 ## Model Routing
 
-Per-role models are configured via `/team`: researcher/implementor/design in `~/.pi/agent/agents/*.md` frontmatter, orchestrator in `~/.pi/agent/orchestrator-config.json`.
+Per-role models are configured via `/team`: researcher/implementor/design in `~/.pi/agent/agents/*.md` frontmatter, orchestrator in `~/.pi/agent/orchestrator-config.json`. Per-role execution mode is also configured via `/team`: sequential-mode delegations run one at a time, while parallel-mode delegations may overlap.
 
 If auth fails, report the failing provider and its auth path (`/login <provider>` or the provider's API key environment variable).
 
