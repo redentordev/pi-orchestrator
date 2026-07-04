@@ -1354,8 +1354,16 @@ class TeamSettingsList extends SettingsList {
     this.ensureSelectableSelection(1);
     const selectedIndex = (this as any).selectedIndex ?? 0;
     const maxVisible = (this as any).maxVisible ?? displayItems.length;
-    const startIndex = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayItems.length - maxVisible));
-    const endIndex = Math.min(startIndex + maxVisible, displayItems.length);
+    let startIndex = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), displayItems.length - maxVisible));
+    // Keep a group header attached to its first member instead of scrolling it out of view.
+    if (startIndex > 0 && !this.isHeaderItem(displayItems[startIndex]) && this.isHeaderItem(displayItems[startIndex - 1])) {
+      startIndex -= 1;
+    }
+    let endIndex = Math.min(Math.max(startIndex + maxVisible, selectedIndex + 1), displayItems.length);
+    // Don't end the window on a dangling header with none of its members visible.
+    while (endIndex > startIndex + 1 && endIndex < displayItems.length && this.isHeaderItem(displayItems[endIndex - 1])) {
+      endIndex -= 1;
+    }
     const selectableLabels = allItems.filter((item: any) => !this.isHeaderItem(item)).map((item: any) => visibleWidth(item.label));
     const maxLabelWidth = Math.min(30, Math.max(...(selectableLabels.length > 0 ? selectableLabels : [0])));
 
