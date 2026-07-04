@@ -21,14 +21,6 @@ From npm:
 pi install npm:@redentor_dev/pi-orchestrator@0.1.0
 ```
 
-From a local checkout:
-
-```bash
-pi install /Users/redentordev/Work/pi-orchestrator
-```
-
-You can also add the absolute package path to `packages` in Pi settings if you prefer manual configuration.
-
 ## Commands
 
 - `/agents` — view and configure the orchestrator and per-role agent provider/model/thinking settings.
