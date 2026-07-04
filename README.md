@@ -6,11 +6,11 @@ Published npm package: `@redentor_dev/pi-orchestrator`.
 
 It provides:
 
-- `delegate_researcher` for read-only codebase research and context gathering.
+- `delegate_researcher` for read-only codebase research and context gathering, including read-only bash inspection/network lookups.
 - `delegate_implementor` for implementation and targeted validation.
 - `delegate_design` for design/UI/UX review-and-fix passes after UI-affecting work.
 - `review_diff` for git status plus combined diff review.
-- `/team` for a persistent settings panel: per-role provider/model/thinking, master on/off, status widget on/off, detail level, and footer mode.
+- `/team` for a persistent settings panel: grouped per-role provider/model/thinking/execution mode, master on/off, status widget on/off, detail level, and footer mode.
 - `/team show | on | off | reset | minimal | default | detailed` for quick text control.
 
 ## Install

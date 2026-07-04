@@ -4,6 +4,7 @@ description: Implementation subagent for making code changes requested by the or
 provider: openai-codex
 model: gpt-5.5
 thinking: medium
+execution: sequential
 tools: read,bash,edit,write,grep,find,ls
 ---
 

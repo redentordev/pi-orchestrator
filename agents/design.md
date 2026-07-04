@@ -4,6 +4,7 @@ description: Design/UI/UX review-and-fix subagent that inspects recently changed
 provider: anthropic
 model: claude-sonnet-5
 thinking: medium
+execution: sequential
 tools: read,bash,edit,write,grep,find,ls
 ---
 
