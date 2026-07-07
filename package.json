@@ -1,8 +1,8 @@
 {
   "name": "@redentor_dev/pi-orchestrator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Pi orchestrator delegation workflow with researcher, implementor, design agents, and live per-role agents status tracking.",
+  "description": "Pi orchestrator delegation workflow with researcher, implementor, design, and custom agents, per-agent on/off with a dynamic orchestrator prompt, and live per-role agents status tracking.",
   "license": "MIT",
   "keywords": [
     "pi-package"

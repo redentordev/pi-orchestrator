@@ -12,8 +12,8 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type StatusView = "minimal" | "default" | "detailed";
 type ExecutionMode = "parallel" | "sequential";
 
-type AgentName = "researcher" | "implementor" | "design";
-type Role = "orchestrator" | "researcher" | "implementor" | "design";
+type AgentName = string;
+type Role = string;
 type BillingOverride = "api" | "subscription";
 type AuthType = "oauth" | "api_key";
 
@@ -70,6 +70,7 @@ interface AgentConfig {
   tools: string[];
   systemPrompt: string;
   billing?: BillingOverride;
+  enabled: boolean;
 }
 
 interface ActivityItem {
@@ -137,11 +138,11 @@ const MAX_EDIT_DETAIL_BYTES = 6_000;
 const MAX_WRITE_DETAIL_BYTES = 2_000;
 const MAX_BASH_DETAIL_BYTES = 1_500;
 const UPDATE_THROTTLE_MS = 80;
-const ROLES: Role[] = ["orchestrator", "researcher", "implementor", "design"];
+const BUILTIN_AGENT_NAMES: readonly string[] = ["researcher", "implementor", "design"];
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const STATUS_VIEWS: StatusView[] = ["minimal", "default", "detailed"];
 const EXECUTION_MODES: ExecutionMode[] = ["parallel", "sequential"];
-const OUR_TOOLS = ["delegate_researcher", "delegate_implementor", "delegate_design", "review_diff"];
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
@@ -159,6 +160,25 @@ function defaultExecutionMode(role: AgentName): ExecutionMode {
   return role === "researcher" ? "parallel" : "sequential";
 }
 
+function isBuiltinAgent(name: string): boolean {
+  return BUILTIN_AGENT_NAMES.includes(name);
+}
+
+function agentSortKey(name: string): number {
+  const index = BUILTIN_AGENT_NAMES.indexOf(name);
+  return index >= 0 ? index : BUILTIN_AGENT_NAMES.length;
+}
+
+function delegateToolName(name: AgentName): string {
+  return `delegate_${name}`;
+}
+
+function agentNameFromToolName(toolName: unknown): AgentName | undefined {
+  if (typeof toolName !== "string" || !toolName.startsWith("delegate_")) return undefined;
+  const name = toolName.slice("delegate_".length);
+  return name.length > 0 ? name : undefined;
+}
+
 function isBillingOverride(value: unknown): value is BillingOverride {
   return value === "api" || value === "subscription";
 }
@@ -168,16 +188,12 @@ function zeroRoleTotals(): RoleTotals {
 }
 
 function zeroTotalsRecord(): Record<Role, RoleTotals> {
-  return {
-    orchestrator: zeroRoleTotals(),
-    researcher: zeroRoleTotals(),
-    implementor: zeroRoleTotals(),
-    design: zeroRoleTotals(),
-  };
+  return { orchestrator: zeroRoleTotals() };
 }
 
 function resetTotals(totals: Record<Role, RoleTotals>) {
-  for (const role of ROLES) totals[role] = zeroRoleTotals();
+  for (const role of Object.keys(totals)) delete totals[role];
+  totals.orchestrator = zeroRoleTotals();
 }
 
 function safeNumber(value: unknown): number {
@@ -229,6 +245,44 @@ function getUserAppendSystemPath(): string {
 
 function getBundledOrchestratorPromptPath(): string {
   return bundledPath("prompts", "orchestrator.md");
+}
+
+function getUserOrchestratorPromptPath(): string {
+  return path.join(getAgentDir(), "prompts", "orchestrator.md");
+}
+
+function ensureUserOrchestratorPrompt(): string {
+  const filePath = getUserOrchestratorPromptPath();
+  if (fs.existsSync(filePath)) return filePath;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const bundled = getBundledOrchestratorPromptPath();
+  fs.writeFileSync(filePath, fs.existsSync(bundled) ? fs.readFileSync(bundled, "utf8") : "", "utf8");
+  return filePath;
+}
+
+function resetUserOrchestratorPrompt(): string | undefined {
+  const filePath = getUserOrchestratorPromptPath();
+  if (!fs.existsSync(filePath)) return undefined;
+  const backupPath = `${filePath}.bak`;
+  fs.rmSync(backupPath, { force: true });
+  fs.renameSync(filePath, backupPath);
+  return backupPath;
+}
+
+function discoverAgentNames(): AgentName[] {
+  const names = new Set<string>(BUILTIN_AGENT_NAMES);
+  for (const dir of [bundledPath("agents"), path.join(getAgentDir(), "agents")]) {
+    try {
+      for (const entry of fs.readdirSync(dir)) {
+        if (!entry.endsWith(".md")) continue;
+        const name = entry.slice(0, -3);
+        if (AGENT_NAME_RE.test(name)) names.add(name);
+      }
+    } catch {
+      // Missing directory is fine; builtins remain.
+    }
+  }
+  return [...names].sort((a, b) => agentSortKey(a) - agentSortKey(b) || a.localeCompare(b));
 }
 
 function zeroUsageSnapshot(): UsageSnapshot {
@@ -290,7 +344,7 @@ function submittedInputCount(input: number, cacheRead: number, cacheWrite: numbe
 }
 
 function addUsageDeltaToTotals(totals: Record<Role, RoleTotals>, role: Role, delta: UsageDelta) {
-  const target = totals[role];
+  const target = totals[role] ?? (totals[role] = zeroRoleTotals());
   target.input += delta.input;
   target.output += delta.output;
   target.cacheRead += delta.cacheRead;
@@ -370,6 +424,52 @@ function saveOrchestratorConfig(patch: Partial<OrchestratorConfig>): Orchestrato
   return next;
 }
 
+function customAgentTemplate(name: AgentName): string {
+  const title = `${name[0].toUpperCase()}${name.slice(1)}`;
+  return `---
+name: ${name}
+description: ${title} subagent. Edit this description so the orchestrator knows exactly when to delegate to it.
+provider: anthropic
+model: claude-sonnet-5
+thinking: medium
+execution: sequential
+tools: read,bash,grep,find,ls
+enabled: true
+---
+
+# ${title}
+
+You are the ${name} subagent.
+
+Describe this agent's job here. The orchestrator sends a task brief; only this system prompt and that brief are your context.
+
+## Responsibilities
+
+- Replace with the agent's concrete responsibilities.
+- Stay within the task given by the orchestrator; report ambiguity instead of guessing.
+- Do not perform final acceptance review. Return the result to the orchestrator.
+
+## Output Budget
+
+Keep the report under ~80 lines; cite \`path:line\` instead of pasting whole files.
+
+## Output Format
+
+1. Summary
+2. Findings Or Changes
+3. Validation Run
+4. Remaining Risks Or Questions
+`;
+}
+
+function scaffoldCustomAgent(name: AgentName): string {
+  const filePath = getUserAgentPath(name);
+  if (fs.existsSync(filePath)) throw new Error(`Agent file already exists: ${filePath}`);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, customAgentTemplate(name), "utf8");
+  return filePath;
+}
+
 function ensureUserAgentFile(role: AgentName): string {
   const filePath = getUserAgentPath(role);
   if (fs.existsSync(filePath)) return filePath;
@@ -384,10 +484,7 @@ function ensureUserAgentFile(role: AgentName): string {
   return filePath;
 }
 
-function updateAgentFrontmatter(
-  role: AgentName,
-  updates: { provider: string; model: string; thinking: ThinkingLevel; execution: ExecutionMode },
-) {
+function updateAgentFrontmatter(role: AgentName, updates: Record<string, string>) {
   const filePath = ensureUserAgentFile(role);
   const content = fs.readFileSync(filePath, "utf8");
   const match = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/);
@@ -418,6 +515,7 @@ function loadAgent(name: AgentName): AgentConfig {
   const execution = isExecutionMode(executionValue) ? executionValue : defaultExecutionMode(name);
   const billingValue = frontmatter.billing?.trim();
   const billing = isBillingOverride(billingValue) ? billingValue : undefined;
+  const enabled = frontmatter.enabled?.trim() !== "false";
   const tools = (frontmatter.tools || "")
     .split(",")
     .map((tool) => tool.trim())
@@ -437,7 +535,16 @@ function loadAgent(name: AgentName): AgentConfig {
     tools,
     systemPrompt: body.trim(),
     billing,
+    enabled,
   };
+}
+
+function loadAgentSafe(name: AgentName): AgentConfig | undefined {
+  try {
+    return loadAgent(name);
+  } catch {
+    return undefined;
+  }
 }
 
 let sequentialChain: Promise<void> = Promise.resolve();
@@ -482,21 +589,48 @@ function runExclusive<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>
   });
 }
 
-let bundledOrchestratorPromptCache: string | null | undefined;
+const AGENT_BLOCK_RE = /[ \t]*<!--\s*agent:([a-z][a-z0-9_-]*)\s*-->[ \t]*\r?\n?([\s\S]*?)[ \t]*<!--\s*\/agent:\1\s*-->[ \t]*\r?\n?/g;
 
-function loadBundledOrchestratorPrompt(): string | undefined {
+/**
+ * Assemble the orchestrator system prompt for the current team:
+ * - Base text is the user's editable copy (~/.pi/agent/prompts/orchestrator.md) when present, else the bundled default.
+ * - `<!-- agent:name -->…<!-- /agent:name -->` blocks are kept only while that agent exists and is enabled.
+ * - Enabled custom agents get an auto-generated roster section; disabled agents get an explicit do-not-use note.
+ */
+function buildOrchestratorPrompt(agentNames: AgentName[]): string | undefined {
   if (fs.existsSync(getUserAppendSystemPath())) return undefined;
-  if (bundledOrchestratorPromptCache !== undefined) return bundledOrchestratorPromptCache || undefined;
 
-  const filePath = getBundledOrchestratorPromptPath();
-  if (!fs.existsSync(filePath)) {
-    bundledOrchestratorPromptCache = null;
-    return undefined;
+  const userPath = getUserOrchestratorPromptPath();
+  const basePath = fs.existsSync(userPath) ? userPath : getBundledOrchestratorPromptPath();
+  if (!fs.existsSync(basePath)) return undefined;
+
+  const agents = new Map<AgentName, AgentConfig | undefined>();
+  for (const name of agentNames) agents.set(name, loadAgentSafe(name));
+  const isEnabled = (name: AgentName) => agents.get(name)?.enabled === true;
+
+  let text = fs.readFileSync(basePath, "utf8");
+  text = text
+    .replace(AGENT_BLOCK_RE, (_match, name: string, body: string) => (isEnabled(name) ? body : ""))
+    .replace(/[ \t]*<!--[\s\S]*?-->[ \t]*\r?\n?/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const customAgents = agentNames.filter((name) => !isBuiltinAgent(name) && isEnabled(name));
+  if (customAgents.length > 0) {
+    const lines = customAgents.map((name) => {
+      const agent = agents.get(name)!;
+      return `- ${delegateToolName(name)} (${agent.execution}): ${agent.description}`;
+    });
+    text += `\n\n## Custom Agents\n\nThese additional delegate tools are available. Brief them with the same Goal/Context/Constraints/Acceptance criteria format, and remember they start with zero context:\n\n${lines.join("\n")}`;
   }
 
-  const text = fs.readFileSync(filePath, "utf8").trim();
-  bundledOrchestratorPromptCache = text.length > 0 ? text : null;
-  return bundledOrchestratorPromptCache || undefined;
+  const disabledAgents = agentNames.filter((name) => agents.get(name) && !isEnabled(name));
+  if (disabledAgents.length > 0) {
+    const toolList = disabledAgents.map((name) => delegateToolName(name)).join(", ");
+    text += `\n\n## Disabled Agents\n\nThese delegate tools are disabled and unavailable: ${toolList}. Do not reference or wait for them; handle that work directly or route it to an enabled agent.`;
+  }
+
+  return text.length > 0 ? text : undefined;
 }
 
 function delegatePromptSnippet(role: AgentName, purpose: string, suffix = ""): string {
@@ -1485,6 +1619,8 @@ function makeReviewDiffRenderers() {
 export default function orchestratorWorkflow(pi: ExtensionAPI) {
   const totals = zeroTotalsRecord();
   let config = loadOrchestratorConfig();
+  let agentNames = discoverAgentNames();
+  const registeredDelegates = new Set<string>();
   let authTypes: Record<string, AuthType> | undefined;
   let orchestratorUsageSnapshot: UsageSnapshot | undefined;
   let statusWidgetTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1530,7 +1666,12 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   };
 
   const getStatusView = (): StatusView => config.statusView ?? "default";
-  const getActiveStatusRoles = (): Role[] => ROLES.filter((role) => hasRoleActivity(totals[role]));
+  const orderedRoles = (): Role[] => {
+    const roles: Role[] = ["orchestrator", ...agentNames];
+    for (const role of Object.keys(totals)) if (!roles.includes(role)) roles.push(role);
+    return roles;
+  };
+  const getActiveStatusRoles = (): Role[] => orderedRoles().filter((role) => totals[role] && hasRoleActivity(totals[role]));
   const statusRowPrefix = (index: number): string => (index === 0 ? "team " : "  ");
 
   const aggregateStatusTotals = (activeRoles: Role[]) => {
@@ -1676,18 +1817,35 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     }
   };
 
+  const allOurToolNames = (): string[] => {
+    const names = new Set(["review_diff"]);
+    for (const name of agentNames) names.add(delegateToolName(name));
+    for (const name of registeredDelegates) names.add(delegateToolName(name));
+    return [...names];
+  };
+
+  const enabledOurToolNames = (): string[] => {
+    const names = ["review_diff"];
+    for (const name of agentNames) {
+      if (loadAgentSafe(name)?.enabled) names.push(delegateToolName(name));
+    }
+    return names;
+  };
+
   const applySystemState = (ctx: any) => {
     const enabled = isSystemEnabled(config);
     const active = pi.getActiveTools?.() ?? [];
     const activeNames = Array.isArray(active) ? active.filter((name: any): name is string => typeof name === "string") : [];
+    const ourNames = allOurToolNames();
 
     if (enabled) {
       const available = new Set(allToolNames(pi));
-      const ours = OUR_TOOLS.filter((name) => available.has(name));
-      pi.setActiveTools?.([...new Set([...activeNames, ...ours])]);
+      const ours = enabledOurToolNames().filter((name) => available.has(name));
+      const kept = activeNames.filter((name) => !ourNames.includes(name) || ours.includes(name));
+      pi.setActiveTools?.([...new Set([...kept, ...ours])]);
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("accent", "● team"));
     } else {
-      pi.setActiveTools?.(activeNames.filter((name) => !OUR_TOOLS.includes(name)));
+      pi.setActiveTools?.(activeNames.filter((name) => !ourNames.includes(name)));
       ctx.ui.setStatus("workflow", ctx.ui.theme.fg("dim", "○ team off"));
     }
 
@@ -1719,10 +1877,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       }
 
       if (message.role !== "toolResult") continue;
-      let role: Role | undefined;
-      if (message.toolName === "delegate_researcher") role = "researcher";
-      else if (message.toolName === "delegate_implementor") role = "implementor";
-      else if (message.toolName === "delegate_design") role = "design";
+      const role = agentNameFromToolName(message.toolName);
       if (!role) continue;
       const details = message.details;
       if (!details || typeof details !== "object") continue;
@@ -1857,7 +2012,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   };
 
   const runLegacyTeamFlow = async (ctx: any) => {
-    const role = (await ctx.ui.select("Configure which role?", ["orchestrator", "researcher", "implementor", "design"])) as Role | undefined;
+    const role = (await ctx.ui.select("Configure which role?", ["orchestrator", ...agentNames])) as Role | undefined;
     if (!role) return;
     const selected = await selectModel(ctx);
     if (!selected) return;
@@ -1890,12 +2045,16 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
 
   const openTeamPanel = async (ctx: any) => {
     const orchestrator = currentOrchestratorModel(ctx);
-    const researcher = loadAgent("researcher");
-    const implementor = loadAgent("implementor");
-    const design = loadAgent("design");
     const roleHeader = (label: string) => ({ id: `header:${label.toLowerCase()}`, header: true, label, currentValue: "" });
     const roleItems = (role: AgentName, agent: AgentConfig) => [
-      roleHeader(`${role[0].toUpperCase()}${role.slice(1)}`),
+      roleHeader(`${role[0].toUpperCase()}${role.slice(1)}${isBuiltinAgent(role) ? "" : " (custom)"}`),
+      {
+        id: `${role}.enabled`,
+        label: "Enabled",
+        description: `off = deactivate ${delegateToolName(role)} and drop this agent from the orchestrator prompt`,
+        currentValue: agent.enabled ? "on" : "off",
+        values: ["on", "off"],
+      },
       {
         id: `${role}.model`,
         label: "Model",
@@ -1915,11 +2074,20 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         values: EXECUTION_MODES,
       },
     ];
+    const agentGroups: any[] = [];
+    for (const name of agentNames) {
+      const agent = loadAgentSafe(name);
+      if (!agent) {
+        ctx.ui.notify(`Skipping ${name}: invalid agent file (needs provider and model in frontmatter).`, "warning");
+        continue;
+      }
+      agentGroups.push(...roleItems(name, agent));
+    }
     const items: any[] = [
       {
         id: "system",
         label: "System",
-        description: "Master switch: tools, prompt injection, widget, footer",
+        description: "Master switch: tools, prompt injection, widget, footer. Add agents with /team add <name>.",
         currentValue: isSystemEnabled(config) ? "on" : "off",
         values: ["on", "off"],
       },
@@ -1936,9 +2104,14 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         currentValue: orchestrator.thinking,
         values: THINKING_LEVELS,
       },
-      ...roleItems("researcher", researcher),
-      ...roleItems("implementor", implementor),
-      ...roleItems("design", design),
+      {
+        id: "orchestrator.prompt",
+        label: "Prompt",
+        description: `custom = editable copy at ${getUserOrchestratorPromptPath()}; default = optimized bundled prompt`,
+        currentValue: fs.existsSync(getUserOrchestratorPromptPath()) ? "custom" : "default",
+        values: ["default", "custom"],
+      },
+      ...agentGroups,
       roleHeader("Display"),
       { id: "statusWidget", label: "Status widget", currentValue: config.statusWidget === false ? "off" : "on", values: ["on", "off"] },
       { id: "statusView", label: "Status detail", currentValue: getStatusView(), values: STATUS_VIEWS },
@@ -1993,7 +2166,26 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
           config = saveOrchestratorConfig({ orchestrator: { provider: current.provider, model: current.model, thinking: value as ThinkingLevel } });
           return;
         }
-        for (const role of ["researcher", "implementor", "design"] as AgentName[]) {
+        if (id === "orchestrator.prompt") {
+          if (value === "custom") {
+            const filePath = ensureUserOrchestratorPrompt();
+            ctx.ui.notify(`Editable orchestrator prompt: ${filePath}`, "info");
+          } else {
+            const backupPath = resetUserOrchestratorPrompt();
+            ctx.ui.notify(
+              backupPath ? `Reverted to bundled prompt; your copy was kept at ${backupPath}` : "Already using the bundled prompt.",
+              "info",
+            );
+          }
+          return;
+        }
+        for (const role of agentNames) {
+          if (id === `${role}.enabled`) {
+            updateAgentFrontmatter(role, { enabled: value === "on" ? "true" : "false" });
+            applySystemState(ctx);
+            ctx.ui.notify(`${role} ${value === "on" ? "enabled" : "disabled"}.`, "info");
+            return;
+          }
           if (id === `${role}.model`) {
             const previous = loadAgent(role);
             const selected = parseModelValue(value);
@@ -2062,19 +2254,21 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     const orchestratorProvider = ctx.model?.provider ?? configured?.provider ?? "unset";
     const orchestratorModel = ctx.model?.id ?? configured?.model ?? "unset";
     const orchestratorThinking = ctx.model ? pi.getThinkingLevel() : (configured?.thinking ?? pi.getThinkingLevel());
-    const researcher = loadAgent("researcher");
-    const implementor = loadAgent("implementor");
-    const design = loadAgent("design");
     const widget = config.statusWidget === false || !isSystemEnabled(config) ? `off (${getStatusView()})` : getStatusView();
     const footer = isSystemEnabled(config) && config.statusWidget !== false && config.replaceFooter !== false ? "directory" : "built-in";
+    const prompt = fs.existsSync(getUserOrchestratorPromptPath()) ? "custom" : "default";
+    const agentParts = agentNames.map((name) => {
+      const agent = loadAgentSafe(name);
+      if (!agent) return `${name} (invalid)`;
+      const state = agent.enabled ? "" : " (off)";
+      return `${name} ${agent.provider}/${agent.model}:${agent.thinking}·${agent.execution}${state}`;
+    });
     return [
       `team ${isSystemEnabled(config) ? "on" : "off"}`,
       `status ${widget}`,
       `footer ${footer}`,
-      `orchestrator ${orchestratorProvider}/${orchestratorModel}:${orchestratorThinking}`,
-      `researcher ${researcher.provider}/${researcher.model}:${researcher.thinking}·${researcher.execution}`,
-      `implementor ${implementor.provider}/${implementor.model}:${implementor.thinking}·${implementor.execution}`,
-      `design ${design.provider}/${design.model}:${design.thinking}·${design.execution}`,
+      `orchestrator ${orchestratorProvider}/${orchestratorModel}:${orchestratorThinking} (prompt ${prompt})`,
+      ...agentParts,
     ].join(" · ");
   };
 
@@ -2085,6 +2279,21 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     onUpdate: ((partial: AgentToolResult<DelegationDetails>) => void) | undefined,
     ctx: any,
   ) => {
+    let agent: AgentConfig;
+    try {
+      agent = loadAgent(role);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Cannot delegate to ${role}: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true,
+      } as AgentToolResult<DelegationDetails>;
+    }
+    if (!agent.enabled) {
+      return {
+        content: [{ type: "text", text: `The ${role} agent is disabled. Do not retry; handle the work another way (the user can re-enable it via /team).` }],
+        isError: true,
+      } as AgentToolResult<DelegationDetails>;
+    }
     const run = async () => {
       throwIfAborted(signal);
       const result = await runDelegatedAgent(
@@ -2100,61 +2309,72 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       refreshStatusWidget(ctx, true);
       return result;
     };
-    return loadAgent(role).execution === "sequential" ? runExclusive(run, signal) : run();
+    return agent.execution === "sequential" ? runExclusive(run, signal) : run();
   };
 
-  pi.registerTool({
-    name: "delegate_researcher",
-    label: "Researcher",
-    description:
-      "Delegate read-only codebase research to the researcher subagent. Use for context gathering, relevance mapping, use-case tracing, and architecture questions before implementation. Fire independent research questions as parallel calls.",
-    promptSnippet: delegatePromptSnippet(
-      "researcher",
-      "read-only context and relevance research",
-      " Fire independent questions as parallel calls.",
-    ),
-    parameters: delegateParams,
-    executionMode: "parallel",
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      return executeDelegation("researcher", params, signal, onUpdate, ctx);
+  const builtinDelegateMeta: Record<string, { label: string; description: string; promptSnippet: string; promptGuidelines?: string[] }> = {
+    researcher: {
+      label: "Researcher",
+      description:
+        "Delegate read-only codebase research to the researcher subagent. Use for context gathering, relevance mapping, use-case tracing, and architecture questions before implementation. Fire independent research questions as parallel calls.",
+      promptSnippet: delegatePromptSnippet(
+        "researcher",
+        "read-only context and relevance research",
+        " Fire independent questions as parallel calls.",
+      ),
     },
-    ...makeDelegateRenderers("Researcher"),
-  });
+    implementor: {
+      label: "Implementor",
+      description:
+        "Delegate implementation to the implementor subagent. Use this for all file edits, code generation, migrations, and targeted validation when useful.",
+      promptSnippet: delegatePromptSnippet("implementor", "implementation and targeted validation"),
+      promptGuidelines: [
+        "All implementation work should be delegated to delegate_implementor and reviewed afterward with review_diff.",
+        "For follow-up fixes or the next milestone of the same work, pass the previous delegation's sessionId to delegate_implementor to continue with retained context.",
+      ],
+    },
+    design: {
+      label: "Design",
+      description:
+        "Delegate a design/UI/UX review-and-fix pass after UI-affecting implementation is complete. It inspects the changed surface, fixes visual/interaction/accessibility issues, and reports deferred UX concerns.",
+      promptSnippet: delegatePromptSnippet("design", "design/UI/UX review-and-fix pass"),
+      promptGuidelines: [
+        "After UI-affecting implementation passes review_diff, run delegate_design scoped to the changed surface, then review_diff again. Skip it for changes with no UI impact.",
+      ],
+    },
+  };
 
-  pi.registerTool({
-    name: "delegate_implementor",
-    label: "Implementor",
-    description:
-      "Delegate implementation to the implementor subagent. Use this for all file edits, code generation, migrations, and targeted validation when useful.",
-    promptSnippet: delegatePromptSnippet("implementor", "implementation and targeted validation"),
-    promptGuidelines: [
-      "All implementation work should be delegated to delegate_implementor and reviewed afterward with review_diff.",
-      "For follow-up fixes or the next milestone of the same work, pass the previous delegation's sessionId to delegate_implementor to continue with retained context.",
-    ],
-    parameters: delegateParams,
-    executionMode: "parallel",
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      return executeDelegation("implementor", params, signal, onUpdate, ctx);
-    },
-    ...makeDelegateRenderers("Implementor"),
-  });
+  const customDelegateMeta = (name: AgentName): { label: string; description: string; promptSnippet: string; promptGuidelines?: string[] } => {
+    const label = `${name[0].toUpperCase()}${name.slice(1)}`;
+    const agent = loadAgentSafe(name);
+    const purpose = agent?.description || `tasks for the custom ${name} agent`;
+    return {
+      label,
+      description: `Delegate a task to the custom ${name} subagent. ${purpose}`,
+      promptSnippet: delegatePromptSnippet(name, purpose),
+    };
+  };
 
-  pi.registerTool({
-    name: "delegate_design",
-    label: "Design",
-    description:
-      "Delegate a design/UI/UX review-and-fix pass after UI-affecting implementation is complete. It inspects the changed surface, fixes visual/interaction/accessibility issues, and reports deferred UX concerns.",
-    promptSnippet: delegatePromptSnippet("design", "design/UI/UX review-and-fix pass"),
-    promptGuidelines: [
-      "After UI-affecting implementation passes review_diff, run delegate_design scoped to the changed surface, then review_diff again. Skip it for changes with no UI impact.",
-    ],
-    parameters: delegateParams,
-    executionMode: "parallel",
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      return executeDelegation("design", params, signal, onUpdate, ctx);
-    },
-    ...makeDelegateRenderers("Design"),
-  });
+  const registerDelegateTool = (name: AgentName) => {
+    if (registeredDelegates.has(name)) return;
+    registeredDelegates.add(name);
+    const meta = builtinDelegateMeta[name] ?? customDelegateMeta(name);
+    pi.registerTool({
+      name: delegateToolName(name),
+      label: meta.label,
+      description: meta.description,
+      promptSnippet: meta.promptSnippet,
+      ...(meta.promptGuidelines ? { promptGuidelines: meta.promptGuidelines } : {}),
+      parameters: delegateParams,
+      executionMode: "parallel",
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        return executeDelegation(name, params, signal, onUpdate, ctx);
+      },
+      ...makeDelegateRenderers(meta.label),
+    });
+  };
+
+  for (const name of agentNames) registerDelegateTool(name);
 
   pi.registerTool({
     name: "review_diff",
@@ -2275,16 +2495,102 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("team", {
-    description: "Team settings: models, thinking, execution, status widget, on/off",
+    description: "Team settings: agents on/off, custom agents, models, thinking, execution, prompt, status widget",
     getArgumentCompletions: (prefix) => {
-      const values = ["show", "on", "off", "reset", ...STATUS_VIEWS];
-      const filtered = values.filter((value) => value.startsWith((prefix || "").trim()));
-      return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
+      const trimmed = (prefix || "").trimStart();
+      const values = [
+        "show",
+        "on",
+        "off",
+        "reset",
+        ...STATUS_VIEWS,
+        "prompt",
+        "prompt reset",
+        "add ",
+        ...agentNames.flatMap((name) => [`enable ${name}`, `disable ${name}`]),
+        ...agentNames.filter((name) => !isBuiltinAgent(name)).map((name) => `remove ${name}`),
+      ];
+      const filtered = values.filter((value) => value.startsWith(trimmed));
+      return filtered.length > 0 ? filtered.map((value) => ({ value, label: value.trim() })) : null;
     },
     handler: async (args, ctx) => {
       const action = (args || "").trim();
+      const [verb, ...rest] = action.split(/\s+/);
+      const target = rest.join(" ").trim();
       if (action === "show") {
         ctx.ui.notify(formatTeamShow(ctx), "info");
+        return;
+      }
+      if (verb === "prompt") {
+        if (target === "reset") {
+          const backupPath = resetUserOrchestratorPrompt();
+          ctx.ui.notify(
+            backupPath
+              ? `Reverted to the bundled orchestrator prompt; your copy was kept at ${backupPath}`
+              : "Already using the bundled orchestrator prompt.",
+            "info",
+          );
+          return;
+        }
+        if (target) {
+          ctx.ui.notify(`Unknown /team prompt argument: ${target} (use /team prompt or /team prompt reset)`, "error");
+          return;
+        }
+        const filePath = ensureUserOrchestratorPrompt();
+        ctx.ui.notify(`Editable orchestrator prompt: ${filePath} — edit it there; changes apply on the next turn. Revert with /team prompt reset.`, "info");
+        return;
+      }
+      if (verb === "add") {
+        if (!AGENT_NAME_RE.test(target)) {
+          ctx.ui.notify(`Invalid agent name: "${target}". Use lowercase letters, digits, - or _ (max 32 chars, starts with a letter).`, "error");
+          return;
+        }
+        if (agentNames.includes(target) || fs.existsSync(getUserAgentPath(target))) {
+          ctx.ui.notify(`Agent ${target} already exists.`, "error");
+          return;
+        }
+        const filePath = scaffoldCustomAgent(target);
+        agentNames = discoverAgentNames();
+        try {
+          registerDelegateTool(target);
+          applySystemState(ctx);
+          ctx.ui.notify(`Created ${target} at ${filePath}. Edit its prompt, model, and tools there; it is live as ${delegateToolName(target)}.`, "info");
+        } catch {
+          ctx.ui.notify(`Created ${target} at ${filePath}. Restart Pi to register ${delegateToolName(target)}.`, "info");
+        }
+        return;
+      }
+      if (verb === "remove") {
+        if (!agentNames.includes(target)) {
+          ctx.ui.notify(`Unknown agent: ${target}`, "error");
+          return;
+        }
+        if (isBuiltinAgent(target)) {
+          ctx.ui.notify(`${target} is a built-in agent and cannot be removed; disable it with /team disable ${target}.`, "error");
+          return;
+        }
+        const filePath = getUserAgentPath(target);
+        const backupPath = `${filePath}.bak`;
+        fs.rmSync(backupPath, { force: true });
+        if (fs.existsSync(filePath)) fs.renameSync(filePath, backupPath);
+        agentNames = discoverAgentNames();
+        applySystemState(ctx);
+        ctx.ui.notify(`Removed ${target} (kept a backup at ${backupPath}). The ${delegateToolName(target)} tool is deactivated; restart Pi to drop it entirely.`, "info");
+        return;
+      }
+      if (verb === "enable" || verb === "disable") {
+        if (!agentNames.includes(target)) {
+          ctx.ui.notify(`Unknown agent: ${target}`, "error");
+          return;
+        }
+        try {
+          updateAgentFrontmatter(target, { enabled: verb === "enable" ? "true" : "false" });
+        } catch (error) {
+          ctx.ui.notify(`Cannot update ${target}: ${error instanceof Error ? error.message : String(error)}`, "error");
+          return;
+        }
+        applySystemState(ctx);
+        ctx.ui.notify(`${target} ${verb}d.`, "info");
         return;
       }
       if (action === "on") {
@@ -2327,7 +2633,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     if (!isSystemEnabled(config)) return;
-    const prompt = loadBundledOrchestratorPrompt();
+    const prompt = buildOrchestratorPrompt(agentNames);
     if (!prompt) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
   });
@@ -2356,6 +2662,14 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     config = loadOrchestratorConfig();
+    agentNames = discoverAgentNames();
+    for (const name of agentNames) {
+      try {
+        registerDelegateTool(name);
+      } catch {
+        // Late registration may be unsupported; the agent activates on next restart.
+      }
+    }
     orchestratorUsageSnapshot = undefined;
     rebuildTotalsFromSession(ctx);
     applySystemState(ctx);
